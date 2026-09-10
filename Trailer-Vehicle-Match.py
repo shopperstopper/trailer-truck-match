@@ -94,8 +94,8 @@ dealer_key = st.session_state.authenticated_dealer
 dealer_info = DEALER_ACCOUNTS[dealer_key]
 
 st.set_page_config(
-    page_title=f"{dealer_info['name']} | TowMatch",
-    page_icon=dealer_info["logo_icon"],
+    page_title=f"{dealer_info['name']} | "Tow Match Pro",
+    page_icon=dealer_info["rv-icon.png"],
     layout="centered",
     initial_sidebar_state="collapsed",
 )

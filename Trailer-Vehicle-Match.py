@@ -1,221 +1,177 @@
-import streamlit as st
+import re
+import time
+import requests
+from bs4 import BeautifulSoup
 import pandas as pd
-import numpy as np
 
-# Dealer Configuration Dictionary
-DEALER_CONFIG = {
-    "APACHE2026": {
-        "name": "Apache Camping Center",
-        "logo_icon": "rv-icon.png",
-        "csv_path": "apache_full_inventory.csv"
-    }
+BASE_URL = "https://www.apachecamping.com"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
 }
 
-# License Key Validation
-query_params = st.query_params
-license_key = query_params.get("key", "APACHE2026")
-dealer_info = DEALER_CONFIG.get(license_key, DEALER_CONFIG["APACHE2026"])
+def clean_int(val_str):
+    if not val_str:
+        return None
+    cleaned = re.sub(r"[^\d]", "", str(val_str))
+    return int(cleaned) if cleaned else None
 
-# Page Setup
-st.set_page_config(
-    page_title=f"{dealer_info['name']} - Tow Match Pro",
-    page_icon=dealer_info["logo_icon"],
-    layout="wide"
-)
-
-# Header
-st.title(f"🚐 {dealer_info['name']} — Tow Match Pro")
-st.caption("Real-time tow capacity match against Apache Camping Center inventory.")
-
-# Load Inventory Data
-@st.cache_data(ttl=300)
-def load_inventory(filepath):
-    try:
-        data = pd.read_csv(filepath)
-    except Exception:
-        return pd.DataFrame()
-
-    # Ensure baseline columns exist
-    default_cols = {
-        "Stock": "N/A",
-        "Condition": "New/Used",
-        "Status": "On Lot",
-        "Type": "Travel Trailer",
-        "Year": "",
-        "Model": "RV Unit",
-        "Length": 26.0,
-        "DryWeight": 5200,
-        "GVWR": 7000,
-        "HitchWeight": np.nan,
-        "Price": "Call for Price",
-        "Location": "All Lots",
+def extract_vdp_specs(vdp_url):
+    specs = {
+        "DryWeight": None,
+        "GVWR": None,
+        "HitchWeight": None,
+        "CargoCapacity": None,
+        "Length": None,
+        "Location": "Unassigned",
         "Image": "",
-        "URL": ""
+        "Status": "On Lot"
     }
-    for col, default_val in default_cols.items():
-        if col not in data.columns:
-            data[col] = default_val
+    try:
+        resp = requests.get(vdp_url, headers=HEADERS, timeout=12)
+        if resp.status_code != 200:
+            return specs
+            
+        soup = BeautifulSoup(resp.content, "html.parser")
+        text = soup.get_text(" ", strip=True)
+        text_lower = text.lower()
 
-    # Numeric Conversions
-    for num_col in ["Length", "DryWeight", "GVWR", "HitchWeight"]:
-        data[num_col] = pd.to_numeric(data[num_col], errors="coerce")
+        # 1. Location Detection
+        if "portland" in text_lower or "clackamas" in text_lower:
+            specs["Location"] = "Portland / Clackamas"
+        elif "everett" in text_lower:
+            specs["Location"] = "Everett"
+        elif "tacoma" in text_lower:
+            specs["Location"] = "Tacoma"
+        elif "kitsap" in text_lower or "poulsbo" in text_lower:
+            specs["Location"] = "Kitsap / Poulsbo"
 
-    # Clean Lengths: convert values recorded in inches (> 45) to decimal feet
-    data["Length"] = data["Length"].apply(
-        lambda x: round(x / 12.0, 1) if pd.notnull(x) and x > 45 else (round(x, 1) if pd.notnull(x) else 24.0)
-    )
+        # 2. Status Detection (Incoming vs On Lot)
+        if "incoming" in text_lower or "inbound" in text_lower or "on order" in text_lower:
+            specs["Status"] = "Inbound / Incoming"
+        else:
+            specs["Status"] = "On Lot"
 
-    # Clean and fill fallback weights
-    data["DryWeight"] = data["DryWeight"].fillna(4800).astype(int)
-    data["GVWR"] = data["GVWR"].fillna(data["DryWeight"] + 1800).astype(int)
-    data["HitchWeight"] = data["HitchWeight"].fillna((data["GVWR"] * 0.12).round()).astype(int)
+        # 3. Image URL
+        img_tag = soup.select_one(".unit-photo img, .gallery-slide img, meta[property='og:image']")
+        if img_tag:
+            specs["Image"] = img_tag.get("content") or img_tag.get("src") or ""
 
-    # If Location is missing or empty, assign a default
-    data["Location"] = data["Location"].fillna("All Lots")
+        # 4. Hitch / Tongue Weight
+        hitch_match = re.search(r"Hitch\s*Weight\s*([\d,]+)\s*lbs?", text, re.IGNORECASE)
+        if hitch_match:
+            specs["HitchWeight"] = clean_int(hitch_match.group(1))
 
-    return data
+        # 5. Dry Weight / Unloaded Weight
+        dry_match = re.search(r"(?:Dry|Unloaded)\s*Weight\s*([\d,]+)\s*lbs?", text, re.IGNORECASE)
+        if dry_match:
+            specs["DryWeight"] = clean_int(dry_match.group(1))
 
-df_raw = load_inventory(dealer_info["csv_path"])
+        # 6. Cargo Capacity
+        cargo_match = re.search(r"Cargo\s*Capacity\s*([\d,]+)\s*lbs?", text, re.IGNORECASE)
+        if cargo_match:
+            specs["CargoCapacity"] = clean_int(cargo_match.group(1))
 
-if df_raw.empty:
-    st.error("Unable to load inventory data. Please verify 'apache_full_inventory.csv' is uploaded.")
-    st.stop()
+        # 7. GVWR
+        gvwr_match = re.search(r"GVWR\s*([\d,]+)\s*lbs?", text, re.IGNORECASE)
+        if gvwr_match:
+            specs["GVWR"] = clean_int(gvwr_match.group(1))
+        elif specs["DryWeight"] and specs["CargoCapacity"]:
+            specs["GVWR"] = specs["DryWeight"] + specs["CargoCapacity"]
 
-# ----------------- SIDEBAR LOT & LENGTH FILTERS -----------------
-st.sidebar.header("Lot & Availability")
+        # 8. Length
+        len_match = re.search(r"Length\s*(\d+)\s*ft(?:\s*(\d+)\s*in)?", text, re.IGNORECASE)
+        if len_match:
+            feet = float(len_match.group(1))
+            inches = float(len_match.group(2)) if len_match.group(2) else 0.0
+            specs["Length"] = round(feet + (inches / 12.0), 1)
+        else:
+            len_alt = re.search(r"Length\s*(\d+)'?\s*(\d+)?\"?", text, re.IGNORECASE)
+            if len_alt and len_alt.group(1):
+                feet = float(len_alt.group(1))
+                inches = float(len_alt.group(2)) if len_alt.group(2) else 0.0
+                specs["Length"] = round(feet + (inches / 12.0), 1)
 
-# Gravel / On Lot filter
-gravel_only = st.sidebar.checkbox("In Stock 'On the Gravel' Only", value=True)
+    except Exception as e:
+        print(f"    Error reading {vdp_url}: {e}")
+        
+    return specs
 
-# Detect if locations are populated in the CSV
-raw_locations = [loc for loc in df_raw["Location"].dropna().unique() if str(loc).strip() not in ["All Lots", "nan", ""]]
+def scrape_apache_catalog():
+    all_units = []
+    seen_urls = set()
+    page = 1
 
-if raw_locations:
-    available_locations = ["All Lots"] + sorted(raw_locations)
-else:
-    available_locations = ["All Lots", "Portland / Clackamas", "Everett", "Tacoma", "Kitsap / Poulsbo"]
+    print("--- Scraping Apache Inventory with Locations & Specs ---")
 
-selected_location = st.sidebar.selectbox(
-    "Dealership Location",
-    options=available_locations,
-    index=0
-)
+    while True:
+        catalog_url = f"{BASE_URL}/rv-search?page={page}"
+        print(f"\n[Fetching Page {page}]")
+        
+        try:
+            resp = requests.get(catalog_url, headers=HEADERS, timeout=15)
+            if resp.status_code != 200:
+                print(f"End of pages reached (Status: {resp.status_code}).")
+                break
+        except Exception as e:
+            print(f"Network error on page {page}: {e}")
+            break
 
-st.sidebar.markdown("---")
-st.sidebar.header("Length Filter (ft)")
-st.sidebar.caption("Leave both at 0 for no length restrictions.")
+        soup = BeautifulSoup(resp.content, "html.parser")
+        raw_links = soup.select("a[href*='/product/'], a[href*='/rv/']")
+        if not raw_links:
+            print("No links found on this page. Ending.")
+            break
 
-col_len_min, col_len_max = st.sidebar.columns(2)
-with col_len_min:
-    min_length_input = st.number_input("Min Length", min_value=0, max_value=50, value=0, step=1)
-with col_len_max:
-    max_length_input = st.number_input("Max Length", min_value=0, max_value=50, value=0, step=1)
+        units_found_on_page = 0
+        for a in raw_links:
+            href = a.get("href", "")
+            title = a.get_text(strip=True)
 
-# ----------------- MAIN VEHICLE INPUTS -----------------
-col1, col2 = st.columns(2)
+            if not href or any(junk in title.lower() for junk in [
+                "send to", "floorplan", "details", "photo", "view", "print", "brochure", "save", "quote"
+            ]):
+                continue
 
-with col1:
-    st.subheader("1. Tow Vehicle Specs")
-    entry_method = st.radio("Entry Method:", ["Door Placard (Fastest)", "Desk Lookup"], horizontal=True)
+            full_vdp_url = href if href.startswith("http") else BASE_URL + href
+            if full_vdp_url in seen_urls:
+                continue
+            
+            seen_urls.add(full_vdp_url)
+            units_found_on_page += 1
 
-    sticker_payload = st.number_input(
-        "Sticker Payload (Yellow Tag lbs)",
-        min_value=500,
-        max_value=8000,
-        value=1650,
-        step=50
-    )
-    truck_gvwr = st.number_input(
-        "Truck GVWR (Safety Tag lbs)",
-        min_value=3000,
-        max_value=20000,
-        value=7100,
-        step=50
-    )
+            specs = extract_vdp_specs(full_vdp_url)
+            time.sleep(0.35)
 
-with col2:
-    st.subheader("2. Trip Loading & Passengers")
-    towable_style = st.radio("Towable Style:", ["Travel Trailer (Bumper Pull)", "Fifth Wheel"], horizontal=True)
-    occupants = st.number_input("Occupants in Truck (Total Count)", min_value=1, max_value=8, value=2, step=1)
-    bed_cargo = st.number_input("Bed Cargo / Gear (lbs)", min_value=0, max_value=2500, value=150, step=25)
-    hitch_hardware = st.number_input("Hitch Hardware Weight (lbs)", min_value=0, max_value=350, value=75, step=5)
+            dry = specs["DryWeight"] if specs["DryWeight"] else 5200
+            gvwr = specs["GVWR"] if specs["GVWR"] else (dry + 1800)
+            hitch = specs["HitchWeight"] if specs["HitchWeight"] else int(round(gvwr * 0.12))
+            length = specs["Length"] if specs["Length"] else 26.0
 
-# Capacity Calculations
-passenger_allowance = occupants * 175
-total_truck_occupant_cargo = passenger_allowance + bed_cargo + hitch_hardware
-available_payload = sticker_payload - total_truck_occupant_cargo
+            print(f"  -> [{specs['Location']}] {title[:28]} | L: {length}' | Dry: {dry} | Hitch: {hitch}")
 
-st.markdown("---")
-st.subheader("Vehicle Towing Envelope")
+            all_units.append({
+                "Model": title,
+                "Length": length,
+                "DryWeight": dry,
+                "GVWR": gvwr,
+                "HitchWeight": hitch,
+                "Location": specs["Location"],
+                "Status": specs["Status"],
+                "Image": specs["Image"],
+                "URL": full_vdp_url
+            })
 
-m1, m2, m3 = st.columns(3)
-m1.metric("Gross Available Payload", f"{available_payload:,} lbs")
-m2.metric("Occupant & Gear Load", f"{total_truck_occupant_cargo:,} lbs")
-m3.metric("Max Tongue Weight Budget", f"{max(0, available_payload):,} lbs")
+        if units_found_on_page == 0 or page >= 25:
+            break
 
-if available_payload <= 0:
-    st.error("⚠️ Passenger and cargo weight exceeds vehicle payload capacity before hooking up a trailer.")
+        page += 1
 
-# ----------------- FILTERING & SAFETY RATINGS -----------------
-df_matches = df_raw.copy()
+    df = pd.DataFrame(all_units)
+    df.to_csv("apache_full_inventory.csv", index=False)
+    print(f"\nSuccessfully saved {len(df)} units with lot locations to 'apache_full_inventory.csv'.")
 
-# Apply Lot filters only if location data is present in the dataset
-if raw_locations:
-    if gravel_only and "Status" in df_matches.columns:
-        df_matches = df_matches[df_matches["Status"].astype(str).str.contains("On Lot|Stock", case=False, na=False)]
-
-    if selected_location != "All Lots":
-        df_matches = df_matches[df_matches["Location"] == selected_location]
-
-# Apply Min/Max Length Filter (only filters if not both set to 0)
-if not (min_length_input == 0 and max_length_input == 0):
-    if min_length_input > 0:
-        df_matches = df_matches[df_matches["Length"] >= min_length_input]
-    if max_length_input > 0:
-        df_matches = df_matches[df_matches["Length"] <= max_length_input]
-
-# Dynamic safety rating calculation (1 = Safe, 2 = Marginal)
-def calculate_safety(row):
-    tongue = row["HitchWeight"]
-    if tongue <= (available_payload * 0.85):
-        return pd.Series(["🟢 Safe to Tow", 1])
-    elif tongue <= available_payload:
-        return pd.Series(["🟡 Marginal (Pack Light)", 2])
-    else:
-        return pd.Series(["🔴 Overload", 3])
-
-df_matches[["Tow Status", "SortOrder"]] = df_matches.apply(calculate_safety, axis=1)
-
-# Keep units that fit the vehicle payload
-df_matches = df_matches[df_matches["SortOrder"].isin([1, 2])].copy()
-
-# Sort order: Safe first (1 before 2), then lowest tongue weight
-df_matches = df_matches.sort_values(by=["SortOrder", "HitchWeight"], ascending=[True, True])
-
-st.markdown("---")
-st.subheader(f"Matching Lot Inventory ({len(df_matches)} Trailers Towable)")
-
-# Display Columns
-show_cols = ["Image", "Tow Status", "Model", "Length", "DryWeight", "GVWR", "HitchWeight", "Price", "Location", "URL"]
-final_cols = [c for c in show_cols if c in df_matches.columns and df_matches[c].notnull().any() and (df_matches[c] != "").any()]
-
-# Always guarantee essential specs are shown
-essential = ["Tow Status", "Model", "Length", "DryWeight", "GVWR", "HitchWeight", "URL"]
-for e in essential:
-    if e in df_matches.columns and e not in final_cols:
-        final_cols.append(e)
-
-st.dataframe(
-    df_matches[final_cols].rename(columns={
-        "Length": "Length (ft)",
-        "DryWeight": "Dry (lbs)",
-        "GVWR": "GVWR (lbs)",
-        "HitchWeight": "Tongue (lbs)"
-    }),
-    column_config={
-        "Image": st.column_config.ImageColumn("Photo", help="Trailer Image"),
-        "URL": st.column_config.LinkColumn("Listing", display_text="View RV")
-    },
-    use_container_width=True,
-    hide_index=True
-)
+if __name__ == "__main__":
+    scrape_apache_catalog()

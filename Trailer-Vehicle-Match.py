@@ -44,7 +44,6 @@ def load_inventory(filepath):
         "HitchWeight": np.nan,
         "Location": "Unassigned",
         "Status": "On Lot",
-        "Condition": "New",
         "Image": "",
         "URL": ""
     }
@@ -52,16 +51,17 @@ def load_inventory(filepath):
         if col not in data.columns:
             data[col] = default_val
 
-    # Infer Condition (New / Used) from Model title if not explicitly tagged
+    # Detect New vs Used directly from the Model title
     def get_condition(row):
-        val = str(row["Condition"]).strip()
-        if val.lower() in ["new", "used"]:
-            return val.capitalize()
-        model_name = str(row["Model"]).lower()
-        if "used" in model_name:
+        model_name = str(row["Model"]).strip().lower()
+        if model_name.startswith("used") or " used " in model_name:
             return "Used"
-        elif "new" in model_name:
+        elif model_name.startswith("new") or " new " in model_name:
             return "New"
+        
+        # Fallback to column if already populated
+        if "Condition" in row and str(row["Condition"]).strip().lower() in ["new", "used"]:
+            return str(row["Condition"]).strip().capitalize()
         return "New"
 
     data["Condition"] = data.apply(get_condition, axis=1)

@@ -70,6 +70,9 @@ def load_inventory(filepath):
     data["GVWR"] = data["GVWR"].fillna(data["DryWeight"] + 1800).astype(int)
     data["HitchWeight"] = data["HitchWeight"].fillna((data["GVWR"] * 0.12).round()).astype(int)
 
+    # If Location is missing or empty, assign a default so filters don't zero out
+    data["Location"] = data["Location"].fillna("All Lots")
+
     return data
 
 df_raw = load_inventory(dealer_info["csv_path"])
@@ -84,14 +87,17 @@ st.sidebar.header("Lot & Availability")
 # Gravel / On Lot filter
 gravel_only = st.sidebar.checkbox("In Stock 'On the Gravel' Only", value=True)
 
-# Location multi-select
-available_locations = sorted([loc for loc in df_raw["Location"].dropna().unique() if loc != "All Lots"])
-if not available_locations:
-    available_locations = ["Portland / Clackamas", "Everett", "Tacoma", "Kitsap / Poulsbo"]
+# Detect if locations are populated in the CSV
+raw_locations = [loc for loc in df_raw["Location"].dropna().unique() if str(loc).strip() not in ["All Lots", "nan", ""]]
+
+if raw_locations:
+    available_locations = ["All Lots"] + sorted(raw_locations)
+else:
+    available_locations = ["All Lots", "Portland / Clackamas", "Everett", "Tacoma", "Kitsap / Poulsbo"]
 
 selected_location = st.sidebar.selectbox(
     "Dealership Location",
-    options=["All Lots"] + available_locations,
+    options=available_locations,
     index=0
 )
 
@@ -143,37 +149,44 @@ if available_payload <= 0:
 # ----------------- FILTERING & SAFETY RATINGS -----------------
 df_matches = df_raw.copy()
 
-# Apply Lot filters
-if gravel_only and "Status" in df_matches.columns:
-    df_matches = df_matches[df_matches["Status"].astype(str).str.contains("On Lot|Stock", case=False, na=False)]
+# Apply Lot filters only if location data is present in the dataset
+if raw_locations:
+    if gravel_only and "Status" in df_matches.columns:
+        df_matches = df_matches[df_matches["Status"].astype(str).str.contains("On Lot|Stock", case=False, na=False)]
 
-if selected_location != "All Lots" and "Location" in df_matches.columns:
-    df_matches = df_matches[df_matches["Location"] == selected_location]
+    if selected_location != "All Lots":
+        df_matches = df_matches[df_matches["Location"] == selected_location]
 
-# Dynamic safety rating calculation based on available payload
+# Dynamic safety rating and numeric sort priority (1 = Safe, 2 = Marginal)
 def calculate_safety(row):
     tongue = row["HitchWeight"]
     if tongue <= (available_payload * 0.85):
-        return "🟢 Safe to Tow"
+        return pd.Series(["🟢 Safe to Tow", 1])
     elif tongue <= available_payload:
-        return "🟡 Marginal (Pack Light)"
+        return pd.Series(["🟡 Marginal (Pack Light)", 2])
     else:
-        return "🔴 Overload"
+        return pd.Series(["🔴 Overload", 3])
 
-df_matches["Tow Status"] = df_matches.apply(calculate_safety, axis=1)
+df_matches[["Tow Status", "SortOrder"]] = df_matches.apply(calculate_safety, axis=1)
 
 # Keep units that fit the vehicle payload
-df_matches = df_matches[df_matches["Tow Status"].isin(["🟢 Safe to Tow", "🟡 Marginal (Pack Light)"])].copy()
+df_matches = df_matches[df_matches["SortOrder"].isin([1, 2])].copy()
 
-# Sort by safe units first, then lightest tongue weight
-df_matches = df_matches.sort_values(by=["Tow Status", "HitchWeight"], ascending=[True, True])
+# Correct sort: Safe first (SortOrder 1 before 2), then lightest tongue weight
+df_matches = df_matches.sort_values(by=["SortOrder", "HitchWeight"], ascending=[True, True])
 
 st.markdown("---")
 st.subheader(f"Matching Lot Inventory ({len(df_matches)} Trailers Towable)")
 
 # Display Columns
 show_cols = ["Image", "Tow Status", "Model", "Length", "DryWeight", "GVWR", "HitchWeight", "Price", "Location", "URL"]
-final_cols = [c for c in show_cols if c in df_matches.columns]
+final_cols = [c for c in show_cols if c in df_matches.columns and df_matches[c].notnull().any() and (df_matches[c] != "").any()]
+
+# Always guarantee essential specs are shown
+essential = ["Tow Status", "Model", "Length", "DryWeight", "GVWR", "HitchWeight", "URL"]
+for e in essential:
+    if e in df_matches.columns and e not in final_cols:
+        final_cols.append(e)
 
 st.dataframe(
     df_matches[final_cols].rename(columns={

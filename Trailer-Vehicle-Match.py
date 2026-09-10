@@ -25,34 +25,50 @@ st.set_page_config(
 
 # Header
 st.title(f"🚐 {dealer_info['name']} — Tow Match Pro")
-st.caption("Match customer tow vehicle capacity against live lot inventory.")
+st.caption("Real-time tow capacity match against Apache Camping Center inventory.")
 
-# Load and Clean Inventory Data
-@st.cache_data(ttl=600)
+# Load Inventory Data
+@st.cache_data(ttl=300)
 def load_inventory(filepath):
     try:
         data = pd.read_csv(filepath)
     except Exception:
         return pd.DataFrame()
 
-    # Ensure required columns exist
-    for col in ["Length", "DryWeight", "GVWR", "HitchWeight"]:
+    # Ensure baseline columns exist
+    default_cols = {
+        "Stock": "N/A",
+        "Condition": "New/Used",
+        "Status": "On Lot",
+        "Type": "Travel Trailer",
+        "Year": "",
+        "Model": "RV Unit",
+        "Length": 26.0,
+        "DryWeight": 5200,
+        "GVWR": 7000,
+        "HitchWeight": np.nan,
+        "Price": "Call for Price",
+        "Location": "All Lots",
+        "Image": "",
+        "URL": ""
+    }
+    for col, default_val in default_cols.items():
         if col not in data.columns:
-            data[col] = np.nan
+            data[col] = default_val
 
-    # Convert numeric fields
-    for col in ["Length", "DryWeight", "GVWR", "HitchWeight"]:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
+    # Numeric Conversions
+    for num_col in ["Length", "DryWeight", "GVWR", "HitchWeight"]:
+        data[num_col] = pd.to_numeric(data[num_col], errors="coerce")
 
-    # Clean Lengths: convert values given in inches (> 45) to decimal feet
+    # Clean Lengths: convert values recorded in inches (> 45) to decimal feet
     data["Length"] = data["Length"].apply(
-        lambda x: round(x / 12.0, 1) if pd.notnull(x) and x > 45 else (round(x, 1) if pd.notnull(x) else 26.0)
+        lambda x: round(x / 12.0, 1) if pd.notnull(x) and x > 45 else (round(x, 1) if pd.notnull(x) else 24.0)
     )
 
-    # Clean and fill fallback weights if unlisted
-    data["DryWeight"] = data["DryWeight"].fillna(5200)
-    data["GVWR"] = data["GVWR"].fillna(data["DryWeight"] + 1800)
-    data["HitchWeight"] = data["HitchWeight"].fillna((data["GVWR"] * 0.12).round())
+    # Clean and fill fallback weights
+    data["DryWeight"] = data["DryWeight"].fillna(4800).astype(int)
+    data["GVWR"] = data["GVWR"].fillna(data["DryWeight"] + 1800).astype(int)
+    data["HitchWeight"] = data["HitchWeight"].fillna((data["GVWR"] * 0.12).round()).astype(int)
 
     return data
 
@@ -62,7 +78,24 @@ if df_raw.empty:
     st.error("Unable to load inventory data. Please verify 'apache_full_inventory.csv' is uploaded.")
     st.stop()
 
-# Layout: Two-Column Form
+# ----------------- SIDEBAR LOT FILTERS -----------------
+st.sidebar.header("Lot & Availability")
+
+# Gravel / On Lot filter
+gravel_only = st.sidebar.checkbox("In Stock 'On the Gravel' Only", value=True)
+
+# Location multi-select
+available_locations = sorted([loc for loc in df_raw["Location"].dropna().unique() if loc != "All Lots"])
+if not available_locations:
+    available_locations = ["Portland / Clackamas", "Everett", "Tacoma", "Kitsap / Poulsbo"]
+
+selected_location = st.sidebar.selectbox(
+    "Dealership Location",
+    options=["All Lots"] + available_locations,
+    index=0
+)
+
+# ----------------- MAIN VEHICLE INPUTS -----------------
 col1, col2 = st.columns(2)
 
 with col1:
@@ -89,25 +122,7 @@ with col2:
     towable_style = st.radio("Towable Style:", ["Travel Trailer (Bumper Pull)", "Fifth Wheel"], horizontal=True)
     occupants = st.number_input("Occupants in Truck (Total Count)", min_value=1, max_value=8, value=2, step=1)
     bed_cargo = st.number_input("Bed Cargo / Gear (lbs)", min_value=0, max_value=2500, value=150, step=25)
-    hitch_hardware = st.number_input("Hitch Hardware Weight (lbs)", min_value=0, max_value=350, value=65, step=5)
-
-# Sidebar Filter Controls
-st.sidebar.header("Inventory Filters")
-max_len_filter = st.sidebar.slider(
-    "Max Trailer Length (ft)",
-    min_value=int(df_raw["Length"].min()),
-    max_value=int(df_raw["Length"].max()),
-    value=int(df_raw["Length"].max()),
-    step=1
-)
-
-max_budget = st.sidebar.slider(
-    "Max Hitch Weight Allowed (lbs)",
-    min_value=200,
-    max_value=2500,
-    value=1500,
-    step=50
-)
+    hitch_hardware = st.number_input("Hitch Hardware Weight (lbs)", min_value=0, max_value=350, value=75, step=5)
 
 # Capacity Calculations
 passenger_allowance = occupants * 175
@@ -123,36 +138,54 @@ m2.metric("Occupant & Gear Load", f"{total_truck_occupant_cargo:,} lbs")
 m3.metric("Max Tongue Weight Budget", f"{max(0, available_payload):,} lbs")
 
 if available_payload <= 0:
-    st.error("Warning: Passenger and bed cargo load exceeds vehicle sticker payload before attaching a trailer.")
+    st.error("⚠️ Passenger and cargo weight exceeds vehicle payload capacity before hooking up a trailer.")
 
-# Filter Matches
-is_bumper = towable_style == "Travel Trailer (Bumper Pull)"
-
-# Tongue calculation: use explicit hitch weight or estimate 12% of GVWR
+# ----------------- FILTERING & SAFETY RATINGS -----------------
 df_matches = df_raw.copy()
-df_matches["EstTongue"] = df_matches["HitchWeight"].fillna(df_matches["GVWR"] * 0.12)
 
-# Apply limits
-df_filtered = df_matches[
-    (df_matches["Length"] <= max_len_filter) &
-    (df_matches["EstTongue"] <= available_payload) &
-    (df_matches["EstTongue"] <= max_budget)
-].copy()
+# Apply Lot filters
+if gravel_only and "Status" in df_matches.columns:
+    df_matches = df_matches[df_matches["Status"].astype(str).str.contains("On Lot|Stock", case=False, na=False)]
+
+if selected_location != "All Lots" and "Location" in df_matches.columns:
+    df_matches = df_matches[df_matches["Location"] == selected_location]
+
+# Dynamic safety rating calculation based on available payload
+def calculate_safety(row):
+    tongue = row["HitchWeight"]
+    if tongue <= (available_payload * 0.85):
+        return "🟢 Safe to Tow"
+    elif tongue <= available_payload:
+        return "🟡 Marginal (Pack Light)"
+    else:
+        return "🔴 Overload"
+
+df_matches["Tow Status"] = df_matches.apply(calculate_safety, axis=1)
+
+# Keep units that fit the vehicle payload
+df_matches = df_matches[df_matches["Tow Status"].isin(["🟢 Safe to Tow", "🟡 Marginal (Pack Light)"])].copy()
+
+# Sort by safe units first, then lightest tongue weight
+df_matches = df_matches.sort_values(by=["Tow Status", "HitchWeight"], ascending=[True, True])
 
 st.markdown("---")
-st.subheader(f"Matching Inventory ({len(df_filtered)} Units Available)")
+st.subheader(f"Matching Lot Inventory ({len(df_matches)} Trailers Towable)")
 
-# Output Table
-display_cols = ["Model", "Length", "DryWeight", "GVWR", "HitchWeight", "URL"]
-display_cols = [c for c in display_cols if c in df_filtered.columns]
+# Display Columns
+show_cols = ["Image", "Tow Status", "Model", "Length", "DryWeight", "GVWR", "HitchWeight", "Price", "Location", "URL"]
+final_cols = [c for c in show_cols if c in df_matches.columns]
 
 st.dataframe(
-    df_filtered[display_cols].rename(columns={
+    df_matches[final_cols].rename(columns={
         "Length": "Length (ft)",
         "DryWeight": "Dry (lbs)",
         "GVWR": "GVWR (lbs)",
-        "HitchWeight": "Hitch (lbs)"
+        "HitchWeight": "Tongue (lbs)"
     }),
+    column_config={
+        "Image": st.column_config.ImageColumn("Photo", help="Trailer Image"),
+        "URL": st.column_config.LinkColumn("Listing", display_text="View RV")
+    },
     use_container_width=True,
     hide_index=True
 )

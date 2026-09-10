@@ -70,7 +70,7 @@ def load_inventory(filepath):
     data["GVWR"] = data["GVWR"].fillna(data["DryWeight"] + 1800).astype(int)
     data["HitchWeight"] = data["HitchWeight"].fillna((data["GVWR"] * 0.12).round()).astype(int)
 
-    # If Location is missing or empty, assign a default so filters don't zero out
+    # If Location is missing or empty, assign a default
     data["Location"] = data["Location"].fillna("All Lots")
 
     return data
@@ -81,7 +81,7 @@ if df_raw.empty:
     st.error("Unable to load inventory data. Please verify 'apache_full_inventory.csv' is uploaded.")
     st.stop()
 
-# ----------------- SIDEBAR LOT FILTERS -----------------
+# ----------------- SIDEBAR LOT & LENGTH FILTERS -----------------
 st.sidebar.header("Lot & Availability")
 
 # Gravel / On Lot filter
@@ -100,6 +100,16 @@ selected_location = st.sidebar.selectbox(
     options=available_locations,
     index=0
 )
+
+st.sidebar.markdown("---")
+st.sidebar.header("Length Filter (ft)")
+st.sidebar.caption("Leave both at 0 for no length restrictions.")
+
+col_len_min, col_len_max = st.sidebar.columns(2)
+with col_len_min:
+    min_length_input = st.number_input("Min Length", min_value=0, max_value=50, value=0, step=1)
+with col_len_max:
+    max_length_input = st.number_input("Max Length", min_value=0, max_value=50, value=0, step=1)
 
 # ----------------- MAIN VEHICLE INPUTS -----------------
 col1, col2 = st.columns(2)
@@ -157,7 +167,14 @@ if raw_locations:
     if selected_location != "All Lots":
         df_matches = df_matches[df_matches["Location"] == selected_location]
 
-# Dynamic safety rating and numeric sort priority (1 = Safe, 2 = Marginal)
+# Apply Min/Max Length Filter (only filters if not both set to 0)
+if not (min_length_input == 0 and max_length_input == 0):
+    if min_length_input > 0:
+        df_matches = df_matches[df_matches["Length"] >= min_length_input]
+    if max_length_input > 0:
+        df_matches = df_matches[df_matches["Length"] <= max_length_input]
+
+# Dynamic safety rating calculation (1 = Safe, 2 = Marginal)
 def calculate_safety(row):
     tongue = row["HitchWeight"]
     if tongue <= (available_payload * 0.85):
@@ -172,7 +189,7 @@ df_matches[["Tow Status", "SortOrder"]] = df_matches.apply(calculate_safety, axi
 # Keep units that fit the vehicle payload
 df_matches = df_matches[df_matches["SortOrder"].isin([1, 2])].copy()
 
-# Correct sort: Safe first (SortOrder 1 before 2), then lightest tongue weight
+# Sort order: Safe first (1 before 2), then lowest tongue weight
 df_matches = df_matches.sort_values(by=["SortOrder", "HitchWeight"], ascending=[True, True])
 
 st.markdown("---")

@@ -44,12 +44,27 @@ def load_inventory(filepath):
         "HitchWeight": np.nan,
         "Location": "Unassigned",
         "Status": "On Lot",
+        "Condition": "New",
         "Image": "",
         "URL": ""
     }
     for col, default_val in default_cols.items():
         if col not in data.columns:
             data[col] = default_val
+
+    # Infer Condition (New / Used) from Model title if not explicitly tagged
+    def get_condition(row):
+        val = str(row["Condition"]).strip()
+        if val.lower() in ["new", "used"]:
+            return val.capitalize()
+        model_name = str(row["Model"]).lower()
+        if "used" in model_name:
+            return "Used"
+        elif "new" in model_name:
+            return "New"
+        return "New"
+
+    data["Condition"] = data.apply(get_condition, axis=1)
 
     # Numeric Conversions
     for num_col in ["Length", "DryWeight", "GVWR", "HitchWeight"]:
@@ -74,14 +89,13 @@ if df_raw.empty:
     st.error("Unable to load inventory data. Please verify 'apache_full_inventory.csv' is uploaded.")
     st.stop()
 
-# ----------------- SIDEBAR LOT & LENGTH FILTERS -----------------
+# ----------------- SIDEBAR LOT & INVENTORY FILTERS -----------------
 st.sidebar.header("Dealership Lot Selection")
 
 # Available locations
 raw_locations = sorted([loc for loc in df_raw["Location"].dropna().unique() if str(loc).strip() not in ["All Lots", "nan", "Unassigned", ""]])
 all_lot_options = ["All Lots"] + (raw_locations if raw_locations else ["Portland / Clackamas", "Everett", "Tacoma", "Kitsap / Poulsbo"])
 
-# Determine default lot from URL parameter if provided
 default_idx = 0
 if param_lot:
     for idx, opt in enumerate(all_lot_options):
@@ -97,6 +111,14 @@ selected_location = st.sidebar.selectbox(
 
 # Lot availability checkbox
 gravel_only = st.sidebar.checkbox("In Stock 'On the Gravel' Only", value=True)
+
+# Condition filter: New / Used / All (Defaults to New)
+selected_condition = st.sidebar.radio(
+    "Inventory Condition",
+    options=["New", "Used", "All"],
+    index=0,
+    horizontal=True
+)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Length Filter (ft)")
@@ -164,6 +186,10 @@ if selected_location != "All Lots" and "Location" in df_matches.columns:
 if gravel_only and "Status" in df_matches.columns:
     df_matches = df_matches[df_matches["Status"].astype(str).str.contains("On Lot|Stock", case=False, na=False)]
 
+# Filter by Condition (New / Used / All)
+if selected_condition != "All":
+    df_matches = df_matches[df_matches["Condition"] == selected_condition]
+
 # Filter by length
 if not (min_length_input == 0 and max_length_input == 0):
     if min_length_input > 0:
@@ -191,13 +217,14 @@ df_matches = df_matches.sort_values(by=["SortOrder", "HitchWeight"], ascending=[
 
 st.markdown("---")
 lot_display_title = f"{selected_location} Lot" if selected_location != "All Lots" else "All Lots"
-st.subheader(f"Matching Inventory for {lot_display_title} ({len(df_matches)} Trailers Towable)")
+condition_suffix = f" ({selected_condition})" if selected_condition != "All" else ""
+st.subheader(f"Matching Inventory for {lot_display_title}{condition_suffix} — {len(df_matches)} Trailers Towable")
 
 # Display Columns
-show_cols = ["Image", "Tow Status", "Model", "Length", "DryWeight", "GVWR", "HitchWeight", "Location", "URL"]
+show_cols = ["Image", "Tow Status", "Condition", "Model", "Length", "DryWeight", "GVWR", "HitchWeight", "Location", "URL"]
 final_cols = [c for c in show_cols if c in df_matches.columns and df_matches[c].notnull().any() and (df_matches[c] != "").any()]
 
-essential = ["Tow Status", "Model", "Length", "DryWeight", "GVWR", "HitchWeight", "Location", "URL"]
+essential = ["Tow Status", "Condition", "Model", "Length", "DryWeight", "GVWR", "HitchWeight", "Location", "URL"]
 for e in essential:
     if e in df_matches.columns and e not in final_cols:
         final_cols.append(e)
